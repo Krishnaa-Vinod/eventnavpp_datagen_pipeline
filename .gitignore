@@ -1,0 +1,8 @@
+event_slam_ws/build/ 
+event_slam_ws/install/
+event_slam_ws/log/
+build/
+install/
+log/
+.vscode/
+# ./event_slam_ws/.vscode/

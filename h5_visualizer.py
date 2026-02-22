@@ -41,6 +41,13 @@ def main():
     print(f"Total Steps: {len(voxels)}")
     print("Use 'd' or Right-Arrow for Next, 'a' or Left-Arrow for Previous, 'q' to quit.")
 
+    # Precompute step_idx → rgb_image_idx mapping for O(1) lookup
+    rgb_lookup = {}
+    if rgb_indices is not None:
+        ri = rgb_indices[:]
+        for img_i, step_i in enumerate(ri):
+            rgb_lookup[int(step_i)] = img_i
+
     fig = plt.figure(figsize=(14, 9))
     gs = fig.add_gridspec(2, 2)
     ax_vox = fig.add_subplot(gs[0, 0])
@@ -65,11 +72,12 @@ def main():
         ax_rgb.clear()
         if rgb_mask[idx]:
             try:
-                img_idx = np.where(rgb_indices[:] == idx)[0][0]
-                img_bgr = rgb_images[img_idx]
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                ax_rgb.imshow(img_rgb)
-                ax_rgb.set_title(f"RGB Goal Frame ({img_bgr.shape[1]}x{img_bgr.shape[0]})")
+                img_idx = rgb_lookup.get(idx)
+                if img_idx is None:
+                    raise KeyError(f"No RGB for step {idx}")
+                img = rgb_images[img_idx]
+                ax_rgb.imshow(img)
+                ax_rgb.set_title(f"RGB Goal Frame ({img.shape[1]}x{img.shape[0]})")
             except Exception as e:
                 ax_rgb.text(0.5, 0.5, f"Load Error: {e}", ha='center', color='orange')
         else:

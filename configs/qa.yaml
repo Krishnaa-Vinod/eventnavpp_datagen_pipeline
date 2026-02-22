@@ -1,0 +1,40 @@
+# QA configuration for rosbag quality checks
+# ─────────────────────────────────────────
+
+# Required topics (at least one alias per category must be present)
+required_topics:
+  events:
+    - /event_camera/events
+  rgb:
+    - /cam_sync/cam0/image_raw
+    - /flir_camera/image_raw
+  odom:
+    - /odom
+
+# Optional topics (logged but not required)
+optional_topics:
+  imu:
+    - /sensors/imu_data
+  velocity:
+    - /commands/velocity
+  camera_info:
+    - /cam_sync/cam0/camera_info
+    - /flir_camera/camera_info
+
+# Thresholds
+min_duration_sec: 2.0
+min_rgb_frames: 10
+min_event_msgs: 10
+min_odom_msgs: 10
+
+# Time overlap: fraction of bag duration where ALL required topics have data
+min_overlap_fraction: 0.5
+
+# Monotonicity: allow N out-of-order timestamps per topic
+monotonic_tolerance_count: 5
+
+# Header stamp vs bag record time drift (max allowed, in ms)
+max_header_vs_bagtime_drift_ms: 5000.0
+
+# Sync check: p95 of |nearest_rgb_ts - event_window_center| must be < this (ms)
+sync_threshold_ms_p95: 200.0

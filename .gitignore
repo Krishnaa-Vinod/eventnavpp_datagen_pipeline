@@ -5,4 +5,9 @@ build/
 install/
 log/
 .vscode/
+__pycache__/
+*.pyc
+*.h5
+*.jsonl
+*.csv
 # ./event_slam_ws/.vscode/

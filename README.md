@@ -13,7 +13,8 @@ End-to-end pipeline for converting ROS2 bag recordings (event camera + RGB + odo
 │   └── qa.yaml                # QA thresholds for bag quality checks
 ├── scripts/
 │   ├── check_rosbags.py       # Step B – bag quality checker
-│   ├── convert_all_rosbags.py # Step C – batch bag → H5 converter
+│   ├── convert_all_rosbags.py # Step C – batch bag → H5 converter (v2: OOM-safe, LZF)
+│   ├── resource_utils.py      # CPU/RAM/GPU resource detection
 │   ├── validate_h5.py         # Step D – H5 validation
 │   └── build_dataset_index.py # Step D – dataset metadata index
 ├── docs/
@@ -34,6 +35,21 @@ python scripts/check_rosbags.py --bags-dir /scratch/kvinod/bags
 python scripts/convert_all_rosbags.py \
     --bags-dir /scratch/kvinod/bags \
     --out-dir /scratch/kvinod/bags/eGo_navi_.h5
+
+# 2b. Convert with speed/safety options (recommended)
+python scripts/convert_all_rosbags.py \
+    --bags-dir /scratch/kvinod/bags \
+    --compression lzf --log-memory --flush-every 10
+
+# 2c. Maximise throughput (parallel, GPU voxelisation)
+python scripts/convert_all_rosbags.py \
+    --bags-dir /scratch/kvinod/bags \
+    --compression lzf --use-gpu --jobs auto --log-memory
+
+# 2d. Re-convert a single bag
+python scripts/convert_all_rosbags.py \
+    --bags-dir /scratch/kvinod/bags \
+    --bag-name data_collect_20260207_150734 --force
 
 # 3. Validate converted files
 python scripts/validate_h5.py --h5-dir /scratch/kvinod/bags/eGo_navi_.h5
@@ -63,6 +79,42 @@ python h5_visualizer.py --h5 /scratch/kvinod/bags/eGo_navi_.h5/data_collect_2026
 - **Event resolution**: 720 × 1280 (Prophesee EVT3)
 - **RGB resolution**: 1024 × 1280 (Bayer RGGB demosaiced)
 - **Action horizon**: 8 steps (2 seconds ahead)
+
+## Converter CLI flags (v2)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bags-dir` | *(required)* | Root directory containing bag folders |
+| `--out-dir` | `/scratch/kvinod/bags/eGo_navi_.h5` | Output directory for `.h5` files |
+| `--bag-name` | `None` | Convert only this single bag |
+| `--force` | `False` | Re-convert even if `.h5` already exists |
+| `--compression` | `lzf` | HDF5 compression: `lzf` (fastest), `gzip`, `none` |
+| `--gzip-level` | `1` | gzip level 1–9 (only with `--compression gzip`) |
+| `--voxel-dtype` | `float32` | Voxel storage dtype: `float32`, `float16` |
+| `--use-gpu` | `False` | GPU voxelisation via torch CUDA `scatter_add_` |
+| `--jobs` | `1` | Parallel bag workers: integer or `auto` (RAM-safe) |
+| `--flush-every` | `10` | Flush H5 file every N steps |
+| `--log-memory` | `False` | Log RSS memory usage every 20 steps |
+| `--report` | `None` | Path to `bag_report.jsonl` (auto-detected) |
+| `--dry-run` | `False` | Print plan without converting |
+
+### Crash safety
+
+- Each bag writes to a temporary file (`<name>.h5.tmp`), then atomically
+  renames to `<name>.h5` on success.
+- On restart, stale `.tmp` files from previous kills are removed automatically.
+
+### Recommended settings
+
+```bash
+# Safe and fast (single-threaded, LZF, memory logging)
+python scripts/convert_all_rosbags.py --bags-dir /scratch/kvinod/bags \
+    --compression lzf --log-memory
+
+# Maximum throughput on a multi-core node
+python scripts/convert_all_rosbags.py --bags-dir /scratch/kvinod/bags \
+    --compression lzf --jobs auto --use-gpu --log-memory
+```
 
 ## Dependencies
 

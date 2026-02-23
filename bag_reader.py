@@ -59,11 +59,14 @@ def deserialize(msg: BagMessage):
 
 # ── reader implementations ────────────────────────────────────────────────────
 
-def _read_via_rosbags(bag_dir: str) -> Iterator[BagMessage]:
+def _read_via_rosbags(bag_dir: str, topics=None) -> Iterator[BagMessage]:
     """Read a bag directory using rosbags (requires valid MCAP end magic)."""
     from rosbags.rosbag2 import Reader
     with Reader(bag_dir) as reader:
-        for conn, ts, rawdata in reader.messages():
+        conns = None
+        if topics is not None:
+            conns = [c for c in reader.connections if c.topic in topics]
+        for conn, ts, rawdata in reader.messages(connections=conns):
             yield BagMessage(
                 topic=conn.topic,
                 timestamp=ts,
@@ -119,7 +122,7 @@ def _fix_msgtype(name: str) -> str:
     return name
 
 
-def _read_via_mcap_stream_fixed(bag_dir: str) -> Iterator[BagMessage]:
+def _read_via_mcap_stream_fixed(bag_dir: str, topics=None) -> Iterator[BagMessage]:
     """Read bag directory via mcap StreamReader with proper msgtype resolution.
 
     Handles truncated MCAP files gracefully (catches EndOfFile).
@@ -154,6 +157,8 @@ def _read_via_mcap_stream_fixed(bag_dir: str) -> Iterator[BagMessage]:
                             msgtype = _fix_msgtype(schema.name)
                         else:
                             msgtype = ch.topic  # last resort
+                        if topics is not None and ch.topic not in topics:
+                            continue
                         yield BagMessage(
                             topic=ch.topic,
                             timestamp=record.log_time,
@@ -183,18 +188,25 @@ def get_topics(bag_dir: str) -> dict:
     return {}
 
 
-def read_bag(bag_dir: str, fallback: bool = True) -> Iterator[BagMessage]:
+def read_bag(bag_dir: str, fallback: bool = True, topics=None) -> Iterator[BagMessage]:
     """Iterate messages from a ROS2 bag directory.
+
+    Args:
+        bag_dir:  Path to the bag directory.
+        fallback: If True, fall back to mcap StreamReader on rosbags failure.
+        topics:   Optional set/list of topic names to include (None = all).
 
     Tries rosbags first; if that fails (truncated MCAP), falls back to
     mcap StreamReader.
     """
+    if topics is not None and not isinstance(topics, set):
+        topics = set(topics)
     try:
-        yield from _read_via_rosbags(bag_dir)
+        yield from _read_via_rosbags(bag_dir, topics=topics)
         return
     except Exception:
         if not fallback:
             raise
 
     # Fallback: mcap StreamReader
-    yield from _read_via_mcap_stream_fixed(bag_dir)
+    yield from _read_via_mcap_stream_fixed(bag_dir, topics=topics)

@@ -36,8 +36,28 @@ EVT3 format (little-endian 16-bit words):
 import numpy as np
 
 
+def _ffill(positions, values, n):
+    """Forward-fill: propagate *values* at sorted *positions* to all later indices.
+
+    Returns an int64 array of length *n* where positions before the first set
+    position are 0, and every position after uses the most recent value.
+    """
+    if len(positions) == 0:
+        return np.zeros(n, dtype=np.int64)
+    # Build segment lengths and use np.repeat (single C call, no arange)
+    vals = np.empty(len(positions) + 1, dtype=np.int64)
+    vals[0] = 0
+    vals[1:] = values
+    bounds = np.empty(len(positions) + 2, dtype=np.int64)
+    bounds[0] = 0
+    bounds[1:-1] = positions
+    bounds[-1] = n
+    lengths = np.diff(bounds)
+    return np.repeat(vals, lengths)
+
+
 def decode_evt3(raw_bytes: bytes, width: int = 1280, height: int = 720):
-    """Decode EVT3 binary data into structured event arrays.
+    """Decode EVT3 binary data into structured event arrays (vectorised).
 
     Parameters
     ----------
@@ -57,84 +77,101 @@ def decode_evt3(raw_bytes: bytes, width: int = 1280, height: int = 720):
 
     words = np.frombuffer(raw_bytes, dtype=np.uint16)
     n = len(words)
-
-    # Pre-allocate (worst case: every word is an event)
-    xs = np.empty(n, dtype=np.int64)
-    ys = np.empty(n, dtype=np.int64)
-    ts = np.empty(n, dtype=np.int64)
-    ps = np.empty(n, dtype=np.int64)
-
-    current_time = np.int64(0)
-    current_y = np.int64(0)
-    current_pol = np.int64(0)
-    base_x = np.int64(0)
-    count = 0
-
-    for i in range(n):
-        w = int(words[i])
-        code = (w >> 12) & 0xF
-        payload = w & 0xFFF
-
-        if code == 0x0 or code == 0xF:
-            # EVT_ADDR_Y / VECTOR_12_Y: set y + polarity
-            current_pol = np.int64((payload >> 11) & 1)
-            current_y = np.int64(payload & 0x7FF)
-
-        elif code == 0x2:
-            # EVT_ADDR_X: emit one event
-            if payload & 0x800:
-                current_time += 1
-            x = np.int64(payload & 0x7FF)
-            if 0 <= x < width and 0 <= current_y < height:
-                xs[count] = x
-                ys[count] = current_y
-                ts[count] = current_time
-                ps[count] = current_pol
-                count += 1
-
-        elif code == 0x3:
-            # VECT_BASE_X
-            base_x = np.int64(payload)
-
-        elif code == 0x4:
-            # VECT_12: 12-bit bitmap → up to 12 events
-            for bit in range(12):
-                if payload & (1 << bit):
-                    x = base_x + np.int64(bit)
-                    if 0 <= x < width and 0 <= current_y < height:
-                        xs[count] = x
-                        ys[count] = current_y
-                        ts[count] = current_time
-                        ps[count] = current_pol
-                        count += 1
-
-        elif code == 0x5:
-            # VECT_8: 8-bit bitmap with offset
-            bitmap = payload & 0xFF
-            offset = (payload >> 8) & 0xF
-            for bit in range(8):
-                if bitmap & (1 << bit):
-                    x = base_x + np.int64(offset * 8 + bit)
-                    if 0 <= x < width and 0 <= current_y < height:
-                        xs[count] = x
-                        ys[count] = current_y
-                        ts[count] = current_time
-                        ps[count] = current_pol
-                        count += 1
-
-        elif code == 0x6:
-            # TIME_LOW
-            current_time = (current_time & ~np.int64(0xFFF)) | np.int64(payload)
-
-        elif code == 0x8:
-            # TIME_HIGH (standalone, ignore CONTINUED_12 combinations)
-            new_high = np.int64(payload) << 12
-            current_time = new_high | (current_time & np.int64(0xFFF))
-
-        # Skip: 0x7 (CONTINUED_4), 0xA (EXT_TRIGGER),
-        #        0xC (OTHERS), 0xE (CONTINUED_12)
-
-    if count == 0:
+    if n == 0:
         return np.empty((0, 4), dtype=np.int64)
 
-    return np.column_stack([xs[:count], ys[:count], ts[:count], ps[:count]])
+    codes = (words >> 12).astype(np.uint8)
+    payloads = (words & 0xFFF).astype(np.int64)
+
+    # ── timestamps ─────────────────────────────────────────────────────
+    # TIME_HIGH (0x8): sets bits 12+
+    th_pos = np.where(codes == 0x8)[0]
+    time_high = _ffill(th_pos, payloads[th_pos] << 12, n)
+
+    # TIME_LOW (0x6): sets bits 0-11
+    tl_pos = np.where(codes == 0x6)[0]
+    time_low_base = _ffill(tl_pos, payloads[tl_pos], n)
+
+    # EVT_ADDR_X (0x2) bit 11 → cumulative +1 increment, resets at TIME_LOW
+    is_evt_x = codes == 0x2
+    has_inc = is_evt_x & ((payloads >> 11) & 1).astype(bool)
+    inc = np.zeros(n, dtype=np.int64)
+    inc[has_inc] = 1
+    cum_inc = np.cumsum(inc)
+
+    cum_at_reset = _ffill(tl_pos, cum_inc[tl_pos], n) if len(tl_pos) > 0 else np.zeros(n, dtype=np.int64)
+
+    timestamp = time_high + time_low_base + (cum_inc - cum_at_reset)
+
+    # ── y + polarity (EVT_ADDR_Y=0x0, VECTOR_12_Y=0xF) ───────────────
+    y_mask = (codes == 0x0) | (codes == 0xF)
+    y_pos = np.where(y_mask)[0]
+    y_ff = _ffill(y_pos, payloads[y_pos] & 0x7FF, n)
+    pol_ff = _ffill(y_pos, (payloads[y_pos] >> 11) & 1, n)
+
+    # ── base_x (VECT_BASE_X=0x3) ──────────────────────────────────────
+    bx_pos = np.where(codes == 0x3)[0]
+    bx_ff = _ffill(bx_pos, payloads[bx_pos], n)
+
+    # ── collect events ─────────────────────────────────────────────────
+    #  EVT_ADDR_X (0x2): one event per word
+    evt_x_pos = np.where(is_evt_x)[0]
+    n_ex = len(evt_x_pos)
+
+    #  VECT_12 (0x4): bitmap → up to 12 events per word
+    v12_pos = np.where(codes == 0x4)[0]
+    #  VECT_8 (0x5): bitmap → up to 8 events per word
+    v8_pos = np.where(codes == 0x5)[0]
+
+    # --- EVT_ADDR_X events ---
+    if n_ex > 0:
+        ex_x = payloads[evt_x_pos] & 0x7FF
+        ex_y = y_ff[evt_x_pos]
+        ex_t = timestamp[evt_x_pos]
+        ex_p = pol_ff[evt_x_pos]
+    else:
+        ex_x = ex_y = ex_t = ex_p = np.empty(0, dtype=np.int64)
+
+    # --- VECT_12 events (bitmap expansion) ---
+    if len(v12_pos) > 0:
+        v12_pay = payloads[v12_pos]
+        bits_12 = np.arange(12, dtype=np.int64)
+        v12_set = ((v12_pay[:, None] >> bits_12[None, :]) & 1).astype(bool)
+        v12_flat = v12_set.ravel()
+        v12_src = np.repeat(v12_pos, 12)[v12_flat]
+        v12_bit = np.tile(bits_12, len(v12_pos))[v12_flat]
+        v12_x = bx_ff[v12_src] + v12_bit
+        v12_y = y_ff[v12_src]
+        v12_t = timestamp[v12_src]
+        v12_p = pol_ff[v12_src]
+    else:
+        v12_x = v12_y = v12_t = v12_p = np.empty(0, dtype=np.int64)
+
+    # --- VECT_8 events (bitmap + offset expansion) ---
+    if len(v8_pos) > 0:
+        v8_pay = payloads[v8_pos]
+        v8_bitmap = v8_pay & 0xFF
+        v8_offset = (v8_pay >> 8) & 0xF
+        bits_8 = np.arange(8, dtype=np.int64)
+        v8_set = ((v8_bitmap[:, None] >> bits_8[None, :]) & 1).astype(bool)
+        v8_flat = v8_set.ravel()
+        v8_src = np.repeat(v8_pos, 8)[v8_flat]
+        v8_bit = np.tile(bits_8, len(v8_pos))[v8_flat]
+        v8_x = bx_ff[v8_src] + np.repeat(v8_offset, 8)[v8_flat] * 8 + v8_bit
+        v8_y = y_ff[v8_src]
+        v8_t = timestamp[v8_src]
+        v8_p = pol_ff[v8_src]
+    else:
+        v8_x = v8_y = v8_t = v8_p = np.empty(0, dtype=np.int64)
+
+    # ── combine + bounds filter ────────────────────────────────────────
+    all_x = np.concatenate([ex_x, v12_x, v8_x])
+    all_y = np.concatenate([ex_y, v12_y, v8_y])
+    all_t = np.concatenate([ex_t, v12_t, v8_t])
+    all_p = np.concatenate([ex_p, v12_p, v8_p])
+
+    valid = (all_x >= 0) & (all_x < width) & (all_y >= 0) & (all_y < height)
+    if not valid.any():
+        return np.empty((0, 4), dtype=np.int64)
+
+    return np.column_stack([all_x[valid], all_y[valid], all_t[valid], all_p[valid]])

@@ -70,7 +70,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from bag_reader import read_bag, deserialize, get_topics, get_ts
-from evt3_decoder import decode_evt3
+from evt3_decoder import decode_evt3, EVT3StreamDecoder
 from resource_utils import get_rss_mb, detect_resources, compute_safe_jobs
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -431,7 +431,7 @@ def convert_bag(
             if hdr_ts is not None:
                 raw_ev = bytes(obj.events)
                 if len(raw_ev) >= 4:
-                    first_evs = decode_evt3(raw_ev, obj.width, obj.height)
+                    first_evs, _state = decode_evt3(raw_ev, obj.width, obj.height)
                     if first_evs is not None and len(first_evs) > 0:
                         first_sensor_us = int(first_evs[0, 2])
                         bag_to_sensor_offset_ns = hdr_ts - first_sensor_us * 1000
@@ -598,6 +598,7 @@ def convert_bag(
     step_cursor = 0          # next step to finalize
     event_buffer = []        # list of small np arrays (rolling window)
     rgb_cache = {}
+    evt3_decoder = EVT3StreamDecoder(width=WIDTH, height=HEIGHT)
     total_event_count = 0
     total_event_msgs = 0
     rgb_stored_count = [0]   # mutable ref for nested fn
@@ -667,7 +668,7 @@ def convert_bag(
             if len(raw_events) < 4:
                 continue
 
-            evs = decode_evt3(raw_events, obj.width, obj.height)
+            evs = evt3_decoder.decode(raw_events)
             if evs is None or len(evs) == 0:
                 continue
 

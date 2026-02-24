@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--bag", required=True,
                         help="Path to bag directory")
     parser.add_argument("--out-dir",
-                        default="/scratch/kvinod/bags/eGo_navi_.h5",
+                        default="/scratch/kvinod/bags/ego_navi_h5_v2",
                         help="Output directory for H5 files")
     parser.add_argument("--compression",
                         choices=["lzf", "gzip", "none"], default="lzf")

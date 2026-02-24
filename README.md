@@ -166,6 +166,7 @@ pyyaml, rich, tqdm   # utilities
 - **Truncated MCAP files**: 44/46 bags have truncated MCAP end magic. The pipeline handles this via `mcap.stream_reader.StreamReader` fallback.
 - **Color fix**: The original `bag_to_h5.py` stored BGR; the new pipeline stores **RGB** directly. The visualizer has been updated to match.
 - **EVT3 decoding**: Uses a custom pure-Python decoder (no `event_camera_py` dependency). Handles EVT_ADDR_Y, EVT_ADDR_X, VECT_BASE_X, VECT_12, VECT_8, TIME_LOW, TIME_HIGH.
+- **Stateful EVT3 unwrapping**: The `EVT3StreamDecoder` class carries TIME_HIGH/TIME_LOW state across packets, fixing a bug where events emitted before the first TIME_HIGH word in a packet received timestamp ≈ 0 (producing permanent black voxels mid-run). Also handles 2^24 µs (~16.77 s) timestamp wraps for recordings longer than ~17 seconds.
 - **Polarity**: This sensor produces ~99.9% OFF events (pol=0 → -1 in voxels).
 
 See [docs/PIPELINE_OVERVIEW.md](docs/PIPELINE_OVERVIEW.md) for full technical details.

@@ -43,6 +43,11 @@ EXPECTED_DATASETS = {
     "rgb_indices":   {"ndim": 1, "dtype_kind": "i"},  # (M,)
 }
 
+# Optional datasets (v3+)
+OPTIONAL_DATASETS = {
+    "actions_valid": {"ndim": 1, "dtype_kind": "b"},  # (N,)
+}
+
 # Thresholds
 MIN_STEPS = 5
 MIN_VOXEL_NONZERO_FRAC = 0.001   # at least 0.1% non-zero across all steps
@@ -85,6 +90,20 @@ def validate_h5(h5_path: str) -> dict:
                         f"{ds_name}: expected dtype.kind='{spec['dtype_kind']}', "
                         f"got '{ds.dtype.kind}'"
                     )
+
+            # Check optional datasets (v3+)
+            for ds_name, spec in OPTIONAL_DATASETS.items():
+                if ds_name in f:
+                    ds = f[ds_name]
+                    if ds.ndim != spec["ndim"]:
+                        result["warnings"].append(
+                            f"{ds_name}: expected ndim={spec['ndim']}, got {ds.ndim}"
+                        )
+                    if ds.dtype.kind != spec["dtype_kind"]:
+                        result["warnings"].append(
+                            f"{ds_name}: expected dtype.kind='{spec['dtype_kind']}', "
+                            f"got '{ds.dtype.kind}'"
+                        )
 
             if result["errors"]:
                 result["status"] = "FAIL"
@@ -249,6 +268,32 @@ def validate_h5(h5_path: str) -> dict:
                 result["warnings"].append(
                     f"Missing metadata attrs: {missing_attrs}"
                 )
+
+            # 10. actions_valid consistency
+            if "actions_valid" in f:
+                av = f["actions_valid"]
+                if av.shape[0] != n_steps:
+                    result["errors"].append(
+                        f"actions_valid length {av.shape[0]} != voxels {n_steps}"
+                    )
+                result["actions_valid_count"] = int(av[:].sum())
+
+            # 11. Goal validation (optional — not an error if absent)
+            goal_step = int(f.attrs.get("goal_step", -1))
+            result["goal_step"] = goal_step
+            if goal_step >= 0:
+                if goal_step >= n_steps:
+                    result["errors"].append(
+                        f"goal_step={goal_step} out of range (0-{n_steps-1})"
+                    )
+                elif "goal_timestamp_ns" in f.attrs:
+                    expected_ts = int(f["timestamps_ns"][goal_step])
+                    actual_ts = int(f.attrs["goal_timestamp_ns"])
+                    if expected_ts != actual_ts:
+                        result["warnings"].append(
+                            f"goal_timestamp_ns mismatch: "
+                            f"attr={actual_ts} vs ts[{goal_step}]={expected_ts}"
+                        )
 
             # Duration
             duration_s = float((ts[-1] - ts[0]) / 1e9)

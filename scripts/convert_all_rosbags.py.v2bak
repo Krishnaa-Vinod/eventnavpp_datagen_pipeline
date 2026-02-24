@@ -1,46 +1,36 @@
 #!/usr/bin/env python3
 """
-convert_all_rosbags.py  — v3: Odom-driven ROSbag → HDF5 converter
+convert_all_rosbags.py  — v2: Memory-safe batch ROSbag → HDF5 converter
 
-Architecture (v3)
-~~~~~~~~~~~~~~~~~
-* **Odom-driven stepping**: Steps are defined by odom time range, NOT by
-  event coverage or RGB availability.  This ensures the full trajectory
-  is captured including the goal at the end.
-* **Actions as relative waypoints**: (dx, dy, dYaw) in robot local frame,
-  exactly matching NoMaD/ViNT/GNM-style mid-level actions.
-* **RGB nearest-neighbor matching**: For each step, pick the nearest RGB
-  frame by timestamp (checking both neighbors around bisect point).
-  rgb_mask indicates whether RGB is present for each step.
-* **Goal labeling support**: goal_step attribute (default -1) can be set
-  post-conversion by the goal picker visualizer.
+Changes from v1
+~~~~~~~~~~~~~~~~
+* **OOM fix**: Pass 1 no longer stores raw RGB CDR bytes in RAM.
+  RGB frames are decoded on-the-fly in Pass 2 and written directly to H5.
 * **Crash safety**: Writes to ``<path>.tmp``, atomically renames on success.
-* **LZF compression** by default.
+  Stale ``.tmp`` files from previous kills are cleaned up on restart.
+* **LZF compression** by default (≈5–10× faster writes than gzip).
+* **Optional GPU voxelisation** via ``--use-gpu`` (torch scatter_add).
+* **Resource-aware parallelism** via ``--jobs auto``.
+* **Memory logging** via ``--log-memory`` (RSS every 20 steps).
+* **Periodic H5 flush** via ``--flush-every`` (default 10 steps).
 
-H5 schema (v3)
-~~~~~~~~~~~~~~
-  voxels          (N, 5, 720, 1280)   float32   [lzf]
-  actions         (N, 8, 3)           float32     — (dx, dy, dYaw) relative waypoints
-  actions_valid   (N,)                bool        — True if full horizon inside odom range
-  timestamps_ns   (N,)                int64
-  rgb_mask        (N,)                bool
-  rgb_images      (M, 1024, 1280, 3)  uint8     [lzf]
-  rgb_indices     (M,)                int32
-
-  Attributes:
-    bag_name, bag_dir, event_topic, rgb_topic, odom_topic
-    voxel_window_us, num_bins, action_chunk
-    compression, voxel_dtype
-    actions_space='relative_waypoints'
-    actions_repr='dx_dy_dyaw'
-    actions_frame='base_link_at_step'
-    dyaw_wrapped='true'
-    goal_step=-1  (updated by goal picker)
+H5 schema (unchanged)
+~~~~~~~~~~~~~~~~~~~~~
+  voxels        (N, 5, 720, 1280)   float32   [lzf]
+  actions       (N, 8, 3)           float32
+  timestamps_ns (N,)                int64
+  rgb_mask      (N,)                bool
+  rgb_images    (M, 1024, 1280, 3)  uint8     [lzf]
+  rgb_indices   (M,)                int32
 
 Usage
 -----
   # Fast default (lzf, CPU, sequential)
   python scripts/convert_all_rosbags.py --bags-dir /scratch/kvinod/bags
+
+  # Maximise speed
+  python scripts/convert_all_rosbags.py --bags-dir /scratch/kvinod/bags \\
+      --compression lzf --use-gpu --jobs auto --log-memory
 
   # Single bag
   python scripts/convert_all_rosbags.py --bags-dir /scratch/kvinod/bags \\
@@ -73,7 +63,7 @@ from bag_reader import read_bag, deserialize, get_topics, get_ts
 from evt3_decoder import decode_evt3
 from resource_utils import get_rss_mb, detect_resources, compute_safe_jobs
 
-# ── constants ──────────────────────────────────────────────────────────────────
+# ── constants (match bag_to_h5.py) ─────────────────────────────────────────────
 VOXEL_WINDOW_US = 250_000   # 250 ms windows
 NUM_BINS        = 5
 HEIGHT, WIDTH   = 720, 1280
@@ -99,11 +89,6 @@ def get_header_stamp_ns(msg):
     if hasattr(msg, "header"):
         return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
     return None
-
-
-def wrap_to_pi(angle):
-    """Wrap angle to [-pi, pi]."""
-    return np.arctan2(np.sin(angle), np.cos(angle))
 
 
 # ── voxelisers ─────────────────────────────────────────────────────────────────
@@ -204,55 +189,34 @@ def events_to_voxel_gpu(events, num_bins, height, width, t_start, t_end, device)
 # ── pose / action helpers ──────────────────────────────────────────────────────
 
 def interpolate_pose(odom_ts, poses, query_ts):
-    """Interpolate odom pose at an arbitrary timestamp."""
     idx = bisect.bisect_left(odom_ts, query_ts)
     if idx == 0:
-        return poses[0].copy()
+        return poses[0]
     if idx >= len(odom_ts):
-        return poses[-1].copy()
+        return poses[-1]
     t0, t1 = odom_ts[idx - 1], odom_ts[idx]
     alpha = (query_ts - t0) / (t1 - t0) if t1 != t0 else 0.0
     p0, p1 = poses[idx - 1], poses[idx]
     x = p0[0] + alpha * (p1[0] - p0[0])
     y = p0[1] + alpha * (p1[1] - p0[1])
-    dyaw = wrap_to_pi(p1[2] - p0[2])
+    dyaw = np.arctan2(np.sin(p1[2] - p0[2]), np.cos(p1[2] - p0[2]))
     return np.array([x, y, p0[2] + alpha * dyaw])
 
 
-def compute_action_chunk(odom_ts, poses, current_ts_ns, odom_end_ns):
-    """Compute (dx, dy, dYaw) relative waypoint actions.
-
-    Returns:
-        actions: (ACTION_CHUNK, 3) float32 — (dx, dy, dYaw) per horizon step
-        valid: bool — True if full horizon is within odom range
-    """
+def compute_action_chunk(odom_ts, poses, current_ts_ns):
     ref = interpolate_pose(odom_ts, poses, current_ts_ns)
     chunk = []
     win_ns = VOXEL_WINDOW_US * 1000
-    cos_yaw = np.cos(ref[2])
-    sin_yaw = np.sin(ref[2])
-
-    horizon_end = current_ts_ns + ACTION_CHUNK * win_ns
-    valid = horizon_end <= odom_end_ns
-
     for k in range(1, ACTION_CHUNK + 1):
-        fut_ts = current_ts_ns + k * win_ns
-        fut = interpolate_pose(odom_ts, poses, fut_ts)
-
-        # World-frame delta
-        dx_w = fut[0] - ref[0]
-        dy_w = fut[1] - ref[1]
-
-        # Rotate into robot local frame at current step (R(-yaw))
-        dx_l =  dx_w * cos_yaw + dy_w * sin_yaw
-        dy_l = -dx_w * sin_yaw + dy_w * cos_yaw
-
-        # Relative yaw change
-        d_yaw = wrap_to_pi(fut[2] - ref[2])
-
-        chunk.append([dx_l, dy_l, d_yaw])
-
-    return np.array(chunk, dtype=np.float32), valid
+        fut = interpolate_pose(odom_ts, poses, current_ts_ns + k * win_ns)
+        dx, dy = fut[0] - ref[0], fut[1] - ref[1]
+        dx_l = dx * np.cos(ref[2]) + dy * np.sin(ref[2])
+        dy_l = -dx * np.sin(ref[2]) + dy * np.cos(ref[2])
+        chunk.append([
+            dx_l, dy_l,
+            np.arctan2(np.sin(fut[2] - ref[2]), np.cos(fut[2] - ref[2])),
+        ])
+    return np.array(chunk, dtype=np.float32)
 
 
 # ── image helpers ──────────────────────────────────────────────────────────────
@@ -299,44 +263,6 @@ def _comp_kwargs(compression, gzip_level):
     return {}
 
 
-# ── nearest RGB matching ──────────────────────────────────────────────────────
-
-def find_nearest_rgb(rgb_ts_sorted, win_center, tolerance_ns):
-    """Find the nearest RGB timestamp to win_center within tolerance.
-
-    Checks both neighbors around the bisect insertion point.
-
-    Returns:
-        (rgb_ts, True) if found within tolerance
-        (None, False) if no match
-    """
-    if not rgb_ts_sorted:
-        return None, False
-
-    r_idx = bisect.bisect_left(rgb_ts_sorted, win_center)
-
-    best_ts = None
-    best_dist = tolerance_ns + 1  # sentinel
-
-    # Check r_idx (right neighbor)
-    if r_idx < len(rgb_ts_sorted):
-        dist = abs(rgb_ts_sorted[r_idx] - win_center)
-        if dist < best_dist:
-            best_dist = dist
-            best_ts = rgb_ts_sorted[r_idx]
-
-    # Check r_idx - 1 (left neighbor)
-    if r_idx > 0:
-        dist = abs(rgb_ts_sorted[r_idx - 1] - win_center)
-        if dist < best_dist:
-            best_dist = dist
-            best_ts = rgb_ts_sorted[r_idx - 1]
-
-    if best_ts is not None and best_dist <= tolerance_ns:
-        return best_ts, True
-    return None, False
-
-
 # ── single-bag converter ──────────────────────────────────────────────────────
 
 def convert_bag(
@@ -350,17 +276,13 @@ def convert_bag(
     flush_every: int = 10,
     log_memory: bool = False,
     dry_run: bool = False,
-    rgb_tolerance_factor: float = 0.5,
 ):
-    """Convert one bag to HDF5 with odom-driven stepping.
+    """Convert one bag to HDF5 with bounded memory.
 
-    Architecture:
-      Pass 1 — lightweight scan: collect odom poses, RGB timestamps,
-               and event sync offset.  **No RGB data stored in RAM.**
-      Pass 2 — Pre-compute ALL step timestamps from odom timeline.
-               Stream events + RGB; for each step, produce voxel (may be
-               zero if no events), match nearest RGB, compute relative
-               waypoint actions.  Write each step to extendable H5.
+    Pass 1 — lightweight scan: collect odom poses, RGB timestamps,
+             and event sync offset.  **No RGB data stored in RAM.**
+    Pass 2 — streaming: read events + RGB together; decode RGB on-demand;
+             write each step immediately to an extendable H5 dataset.
     """
     bag_name = os.path.basename(bag_dir)
     result = {
@@ -378,17 +300,12 @@ def convert_bag(
     rgb_topic = resolve_topic(available, RGB_ALIASES)
     odom_topic = resolve_topic(available, ODOM_ALIASES)
 
-    if not event_topic:
-        result["status"] = "FAIL"
-        result["error"] = f"Missing event topic (tried {EVENT_ALIASES})"
+    if not all([event_topic, rgb_topic, odom_topic]):
+        result["status"] = "SKIP"
+        result["error"] = (
+            f"Missing topics: ev={event_topic} rgb={rgb_topic} odom={odom_topic}"
+        )
         return result
-    if not odom_topic:
-        result["status"] = "FAIL"
-        result["error"] = f"Missing odom topic (tried {ODOM_ALIASES})"
-        return result
-    # RGB is optional — no failure if missing
-    if not rgb_topic:
-        print(f"  WARNING: No RGB topic found — proceeding without RGB")
 
     if dry_run:
         result["status"] = "DRY_RUN"
@@ -398,12 +315,10 @@ def convert_bag(
     print(f"  Pass 1: scanning odom + rgb timestamps …")
     odom_ts = []
     odom_poses = []
-    rgb_ts = []
+    rgb_ts = []                         # header timestamps only
     bag_to_sensor_offset_ns = None
 
-    p1_topics = {odom_topic, event_topic}
-    if rgb_topic:
-        p1_topics.add(rgb_topic)
+    p1_topics = {odom_topic, rgb_topic, event_topic}
 
     for msg in read_bag(bag_dir, topics=p1_topics):
         if msg.topic == odom_topic:
@@ -416,7 +331,7 @@ def convert_bag(
             odom_ts.append(ts)
             odom_poses.append(np.array([p.x, p.y, yaw]))
 
-        elif rgb_topic and msg.topic == rgb_topic:
+        elif msg.topic == rgb_topic:
             # Quick CDR timestamp extraction (skip full deserialization)
             if len(msg.data) >= 12:
                 _sec = int.from_bytes(msg.data[4:8], "little")
@@ -457,40 +372,34 @@ def convert_bag(
     if log_memory:
         print(f"  RSS after Pass 1: {get_rss_mb():.0f} MB")
 
-    # ── compute step timestamps (ODOM-DRIVEN) ─────────────────────────────
+    # ── compute window range ──────────────────────────────────────────────
     win_ns = VOXEL_WINDOW_US * 1000
-    odom_start = odom_ts[0]
-    odom_end = odom_ts[-1]
+    curr_win_start = max(
+        odom_ts[0],
+        rgb_ts_sorted[0] if rgb_ts_sorted else odom_ts[0],
+        bag_to_sensor_offset_ns,
+    )
+    last_safe = odom_ts[-1] - ACTION_CHUNK * win_ns
 
-    # Steps span the full odom range.  Generate steps until the step
-    # window fits: step_start + win_ns <= odom_end.
-    step_timestamps = []
-    t = odom_start
-    while t + win_ns <= odom_end:
-        step_timestamps.append(t)
-        t += win_ns
-
-    n_total_steps = len(step_timestamps)
-    if n_total_steps < 1:
+    if curr_win_start + win_ns > last_safe:
         result["status"] = "FAIL"
-        result["error"] = "Trajectory too short for even 1 step"
+        result["error"] = "Trajectory too short for action chunks"
         return result
-
-    print(f"  Odom-driven steps: {n_total_steps} "
-          f"(odom span: {(odom_end - odom_start)/1e9:.2f}s)")
-
-    # RGB tolerance: max distance from step center for RGB match
-    rgb_tolerance_ns = int(win_ns * rgb_tolerance_factor)
 
     # ── precompute which RGB timestamps are needed ────────────────────────
     needed_rgb_ts = set()
-    for step_ts in step_timestamps:
-        center = step_ts + win_ns // 2
-        rgb_ts_match, found = find_nearest_rgb(
-            rgb_ts_sorted, center, rgb_tolerance_ns
-        )
-        if found:
-            needed_rgb_ts.add(rgb_ts_match)
+    tmp_start = curr_win_start
+    while tmp_start + win_ns <= last_safe:
+        center = tmp_start + win_ns // 2
+        r_idx = bisect.bisect_left(rgb_ts_sorted, center)
+        if r_idx < len(rgb_ts_sorted):
+            if abs(rgb_ts_sorted[r_idx] - center) < win_ns // 2:
+                needed_rgb_ts.add(rgb_ts_sorted[r_idx])
+        # also check r_idx-1 (could be nearer)
+        if r_idx > 0:
+            if abs(rgb_ts_sorted[r_idx - 1] - center) < win_ns // 2:
+                needed_rgb_ts.add(rgb_ts_sorted[r_idx - 1])
+        tmp_start += win_ns
 
     print(f"  Will buffer ≤{len(needed_rgb_ts)} needed RGB frames on-the-fly")
 
@@ -520,114 +429,38 @@ def convert_bag(
     )
 
     # ── Pass 2: streaming events + on-demand RGB ─────────────────────────
-    # Memory-efficient: events are streamed message-by-message and buffered
-    # only for the active step window.  This avoids loading all events
-    # (~16 GB+) into a single array, keeping peak RSS under the SLURM
-    # memory limit.
-    print(f"  Pass 2: streaming events + RGB …")
+    print(f"  Pass 2: streaming events → voxels …")
 
     tmp_path = h5_path + ".tmp"
     os.makedirs(os.path.dirname(tmp_path) or ".", exist_ok=True)
 
-    # Pre-compute sensor-time window boundaries for every step
-    step_sensor_start = np.array(
-        [(t - bag_to_sensor_offset_ns) / 1000.0 for t in step_timestamps],
-        dtype=np.float64,
-    )
-    step_sensor_end = step_sensor_start + VOXEL_WINDOW_US  # µs
+    event_buffer = []
+    step_idx = 0
+    rgb_stored_count = 0
+    rgb_cache = {}          # header_ts → decoded numpy image
+    curr_win = curr_win_start
+    ev_msg_since_step = 0   # stall detection counter
+    stalled = False
 
-    # ── helper: finalize a step (voxel + action + RGB) ────────────────
-    def _finalize_step(
-        step_idx, event_buf, f, d_vox, d_act, d_act_valid,
-        d_ts, d_msk, d_rgb, d_rid, rgb_stored_count_ref,
-    ):
-        """Produce voxel from buffered events, compute action, match RGB,
-        and write the step to HDF5.  Returns updated rgb_stored_count."""
-        s_start = step_sensor_start[step_idx]
-        s_end = step_sensor_end[step_idx]
-        step_ts = step_timestamps[step_idx]
-        rgb_count = rgb_stored_count_ref[0]
-
-        # ── Voxel: extract events in this window ──────────────────────
-        if event_buf:
-            buf = np.concatenate(event_buf)
-            mask = (buf[:, 2] >= s_start) & (buf[:, 2] < s_end)
-            win_events = buf[mask] if mask.any() else None
-            del buf, mask
-        else:
-            win_events = None
-
-        voxel = voxelizer(
-            win_events, NUM_BINS, HEIGHT, WIDTH, s_start, s_end,
-        )
-        del win_events
-        if np_voxel_dtype == np.float16:
-            voxel = voxel.astype(np.float16)
-
-        # ── Actions ───────────────────────────────────────────────────
-        action_chunk, action_valid = compute_action_chunk(
-            odom_ts, odom_poses, step_ts, odom_end,
-        )
-
-        # ── RGB matching ──────────────────────────────────────────────
-        win_center = step_ts + win_ns // 2
-        rgb_match_ts, has_rgb = find_nearest_rgb(
-            rgb_ts_sorted, win_center, rgb_tolerance_ns,
-        )
-        if has_rgb and rgb_match_ts in rgb_cache:
-            img = rgb_cache[rgb_match_ts]
-            d_rgb.resize(rgb_count + 1, axis=0)
-            d_rid.resize(rgb_count + 1, axis=0)
-            d_rgb[rgb_count] = img
-            d_rid[rgb_count] = step_idx
-            rgb_count += 1
-        else:
-            has_rgb = False
-
-        # ── Write step ────────────────────────────────────────────────
-        d_vox[step_idx] = voxel
-        d_act[step_idx] = action_chunk
-        d_act_valid[step_idx] = action_valid
-        d_ts[step_idx] = step_ts
-        d_msk[step_idx] = has_rgb
-
-        rgb_stored_count_ref[0] = rgb_count
-        return rgb_count
-
-    # ── streaming state ───────────────────────────────────────────────
-    step_cursor = 0          # next step to finalize
-    event_buffer = []        # list of small np arrays (rolling window)
-    rgb_cache = {}
-    total_event_count = 0
-    total_event_msgs = 0
-    rgb_stored_count = [0]   # mutable ref for nested fn
-
-    p2_topics = {event_topic}
-    if rgb_topic:
-        p2_topics.add(rgb_topic)
+    p2_topics = {event_topic, rgb_topic}
 
     with h5py.File(tmp_path, "w") as f:
         d_vox = f.create_dataset(
-            "voxels", (n_total_steps, NUM_BINS, HEIGHT, WIDTH),
+            "voxels", (0, NUM_BINS, HEIGHT, WIDTH),
+            maxshape=(None, NUM_BINS, HEIGHT, WIDTH),
             dtype=np_voxel_dtype,
             chunks=(1, NUM_BINS, HEIGHT, WIDTH),
             **comp,
         )
         d_act = f.create_dataset(
-            "actions", (n_total_steps, ACTION_CHUNK, 3),
-            dtype="float32",
-        )
-        d_act_valid = f.create_dataset(
-            "actions_valid", (n_total_steps,),
-            dtype="bool",
+            "actions", (0, ACTION_CHUNK, 3),
+            maxshape=(None, ACTION_CHUNK, 3), dtype="float32",
         )
         d_ts = f.create_dataset(
-            "timestamps_ns", (n_total_steps,),
-            dtype="int64",
+            "timestamps_ns", (0,), maxshape=(None,), dtype="int64",
         )
         d_msk = f.create_dataset(
-            "rgb_mask", (n_total_steps,),
-            dtype="bool",
+            "rgb_mask", (0,), maxshape=(None,), dtype="bool",
         )
         d_rgb = f.create_dataset(
             "rgb_images", (0, RGB_HEIGHT, RGB_WIDTH, 3),
@@ -637,15 +470,19 @@ def convert_bag(
             **comp,
         )
         d_rid = f.create_dataset(
-            "rgb_indices", (0,),
-            maxshape=(None,),
-            dtype="int32",
+            "rgb_indices", (0,), maxshape=(None,), dtype="int32",
         )
 
-        # ── stream bag messages ───────────────────────────────────────
         for bag_msg in read_bag(bag_dir, topics=p2_topics):
-            # --- RGB: cache only needed frames ---
-            if rgb_topic and bag_msg.topic == rgb_topic:
+            if curr_win + win_ns > last_safe:
+                break
+            if stalled:
+                break
+
+            # ── on-demand RGB caching ─────────────────────────────────
+            if bag_msg.topic == rgb_topic:
+                # Quick timestamp from CDR header (avoid full deserialization
+                # for non-needed frames — saves ~75% of RGB processing)
                 if len(bag_msg.data) >= 12:
                     _sec = int.from_bytes(bag_msg.data[4:8], "little")
                     _nsec = int.from_bytes(bag_msg.data[8:12], "little")
@@ -661,7 +498,7 @@ def convert_bag(
             if bag_msg.topic != event_topic:
                 continue
 
-            # --- Events: decode and buffer ---
+            # ── event processing ──────────────────────────────────────
             obj = deserialize(bag_msg)
             raw_events = bytes(obj.events)
             if len(raw_events) < 4:
@@ -671,93 +508,107 @@ def convert_bag(
             if evs is None or len(evs) == 0:
                 continue
 
-            # Discard events before current step's window to bound memory.
-            # Without this, millions of early events accumulate in the
-            # buffer before the first step can be finalized.
-            if step_cursor < n_total_steps:
-                min_needed = step_sensor_start[step_cursor]
-                keep = evs[:, 2] >= min_needed
-                if not keep.any():
-                    continue
-                if not keep.all():
-                    evs = evs[keep]
-
             event_buffer.append(evs)
-            total_event_count += len(evs)
-            total_event_msgs += 1
 
-            # --- Finalize completed steps ---
-            latest_sensor_t = evs[:, 2].max()
-            while (step_cursor < n_total_steps
-                   and latest_sensor_t >= step_sensor_end[step_cursor]):
-                _finalize_step(
-                    step_cursor, event_buffer,
-                    f, d_vox, d_act, d_act_valid,
-                    d_ts, d_msk, d_rgb, d_rid, rgb_stored_count,
+            # ── buffer safety: trim old events periodically ───────────
+            if len(event_buffer) > 200:
+                all_tmp = np.concatenate(event_buffer)
+                t_keep = (curr_win - bag_to_sensor_offset_ns) // 1000
+                mask = all_tmp[:, 2] >= t_keep
+                event_buffer = [all_tmp[mask]] if mask.any() else []
+                del all_tmp
+
+            t_sensor_query = (curr_win + win_ns - bag_to_sensor_offset_ns) // 1000
+            if evs[-1, 2] < t_sensor_query:
+                ev_msg_since_step += 1
+                # stall detection: if 10000 event messages without a new step
+                if ev_msg_since_step > 10000:
+                    print(
+                        f"\n  WARNING: stall at step {step_idx} "
+                        f"(evs[-1,2]={evs[-1,2]:.0f} < query={t_sensor_query:.0f}), "
+                        f"skipping rest of bag"
+                    )
+                    stalled = True
+                    break
+                continue
+
+            all_evs = np.concatenate(event_buffer)
+
+            while len(all_evs) > 0 and all_evs[-1, 2] >= t_sensor_query:
+                t_sensor_start = (curr_win - bag_to_sensor_offset_ns) // 1000
+                split = bisect.bisect_left(all_evs[:, 2], t_sensor_query)
+
+                voxel = voxelizer(
+                    all_evs[:split], NUM_BINS, HEIGHT, WIDTH,
+                    t_sensor_start, t_sensor_query,
                 )
+                if np_voxel_dtype == np.float16:
+                    voxel = voxel.astype(np.float16)
 
-                # periodic flush + progress
-                if (step_cursor + 1) % flush_every == 0:
+                # ── RGB matching (same logic as v1) ───────────────────
+                win_center = curr_win + win_ns // 2
+                r_idx = bisect.bisect_left(rgb_ts_sorted, win_center)
+                has_rgb = False
+
+                if r_idx < len(rgb_ts_sorted):
+                    nearest_ts = rgb_ts_sorted[r_idx]
+                    if abs(nearest_ts - win_center) < win_ns // 2:
+                        if nearest_ts in rgb_cache:
+                            img = rgb_cache.pop(nearest_ts)
+                            d_rgb.resize(rgb_stored_count + 1, axis=0)
+                            d_rid.resize(rgb_stored_count + 1, axis=0)
+                            d_rgb[rgb_stored_count] = img
+                            d_rid[rgb_stored_count] = step_idx
+                            rgb_stored_count += 1
+                            has_rgb = True
+
+                # ── write step ────────────────────────────────────────
+                for d in [d_vox, d_act, d_ts, d_msk]:
+                    d.resize(step_idx + 1, axis=0)
+                d_vox[step_idx] = voxel
+                d_act[step_idx] = compute_action_chunk(
+                    odom_ts, odom_poses, curr_win
+                )
+                d_ts[step_idx] = curr_win
+                d_msk[step_idx] = has_rgb
+
+                step_idx += 1
+                ev_msg_since_step = 0   # reset stall counter
+                curr_win += win_ns
+                t_sensor_query = (
+                    curr_win + win_ns - bag_to_sensor_offset_ns
+                ) // 1000
+
+                # ── periodic flush + progress ─────────────────────────
+                if step_idx % flush_every == 0:
                     f.flush()
-                if (step_cursor + 1) % 20 == 0:
+
+                if step_idx % 20 == 0:
                     extra = ""
                     if log_memory:
                         extra = f" | RSS: {get_rss_mb():.0f} MB"
                     print(
-                        f"\r  Steps: {step_cursor + 1}/{n_total_steps} | "
-                        f"RGB: {rgb_stored_count[0]} | "
-                        f"Events: {total_event_count:,}{extra}",
+                        f"\r  Steps: {step_idx} | RGB: {rgb_stored_count}"
+                        f"{extra}",
                         end="", flush=True,
                     )
 
-                step_cursor += 1
+                # ── trim event buffer + clean old RGB cache ───────────
+                all_evs = all_evs[split:]
+                if curr_win + win_ns > last_safe:
+                    break
 
-                # Trim buffer: drop blocks entirely before current step
-                if step_cursor < n_total_steps:
-                    trim_t = step_sensor_start[step_cursor]
-                    event_buffer = [
-                        b for b in event_buffer
-                        if b[:, 2].max() >= trim_t
-                    ]
+                old_keys = [k for k in rgb_cache if k < curr_win - win_ns]
+                for k in old_keys:
+                    del rgb_cache[k]
 
-        # ── finalize remaining steps after all messages ───────────────
-        while step_cursor < n_total_steps:
-            _finalize_step(
-                step_cursor, event_buffer,
-                f, d_vox, d_act, d_act_valid,
-                d_ts, d_msk, d_rgb, d_rid, rgb_stored_count,
-            )
-
-            if (step_cursor + 1) % flush_every == 0:
-                f.flush()
-            if (step_cursor + 1) % 20 == 0:
-                extra = ""
-                if log_memory:
-                    extra = f" | RSS: {get_rss_mb():.0f} MB"
-                print(
-                    f"\r  Steps: {step_cursor + 1}/{n_total_steps} | "
-                    f"RGB: {rgb_stored_count[0]} | "
-                    f"Events: {total_event_count:,}{extra}",
-                    end="", flush=True,
-                )
-
-            step_cursor += 1
-
-            if step_cursor < n_total_steps:
-                trim_t = step_sensor_start[step_cursor]
-                event_buffer = [
-                    b for b in event_buffer
-                    if b[:, 2].max() >= trim_t
-                ]
-
-        print(f"\n  Events: {total_event_count:,} total from "
-              f"{total_event_msgs} msgs (streamed)")
+            event_buffer = [all_evs] if len(all_evs) > 0 else []
 
         # ── metadata attributes ───────────────────────────────────────
         f.attrs["bag_name"] = bag_name
         f.attrs["bag_dir"] = bag_dir
         f.attrs["event_topic"] = event_topic
-        f.attrs["rgb_topic"] = rgb_topic if rgb_topic else ""
+        f.attrs["rgb_topic"] = rgb_topic
         f.attrs["odom_topic"] = odom_topic
         f.attrs["voxel_window_us"] = VOXEL_WINDOW_US
         f.attrs["num_bins"] = NUM_BINS
@@ -765,31 +616,18 @@ def convert_bag(
         f.attrs["compression"] = compression
         f.attrs["voxel_dtype"] = voxel_dtype
 
-        # Action semantics metadata
-        f.attrs["actions_space"] = "relative_waypoints"
-        f.attrs["actions_repr"] = "dx_dy_dyaw"
-        f.attrs["actions_frame"] = "base_link_at_step"
-        f.attrs["dyaw_wrapped"] = "true"
-
-        # Goal (default: not set)
-        f.attrs["goal_step"] = -1
-
     # ── atomic rename ─────────────────────────────────────────────────────
     os.replace(tmp_path, h5_path)
 
-    # Clean up
-    del event_buffer
-    rgb_cache.clear()
-
     rss = get_rss_mb()
     print(
-        f"\n  Done: {n_total_steps} steps, {rgb_stored_count[0]} RGB → {h5_path}"
+        f"\n  Done: {step_idx} steps, {rgb_stored_count} RGB → {h5_path}"
         + (f"  (RSS {rss:.0f} MB)" if log_memory else "")
     )
 
     result["status"] = "OK"
-    result["steps"] = n_total_steps
-    result["rgb_stored"] = rgb_stored_count[0]
+    result["steps"] = step_idx
+    result["rgb_stored"] = rgb_stored_count
     result["peak_rss_mb"] = round(rss, 1) if rss > 0 else None
     return result
 
@@ -797,7 +635,7 @@ def convert_bag(
 # ── multiprocessing worker ─────────────────────────────────────────────────────
 
 def _convert_worker(args_tuple):
-    """Worker function for multiprocessing."""
+    """Worker function for multiprocessing.  Receives (bag_dir, h5_path, kwargs)."""
     bag_dir, h5_path, kwargs = args_tuple
     bag_name = os.path.basename(bag_dir)
     print(f"[Worker] {bag_name}")
@@ -822,8 +660,9 @@ def _convert_worker(args_tuple):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert ROS2 bags to HDF5 dataset (v3, odom-driven)."
+        description="Convert GOOD ROS2 bags to HDF5 dataset (v2)."
     )
+    # ── existing flags ────────────────────────────────────────────────────
     parser.add_argument("--bags-dir", required=True)
     parser.add_argument(
         "--out-dir",
@@ -837,6 +676,7 @@ def main():
         "--force", action="store_true", help="Re-convert even if .h5 exists."
     )
 
+    # ── new performance flags ─────────────────────────────────────────────
     parser.add_argument(
         "--compression",
         choices=["lzf", "gzip", "none"],
@@ -969,6 +809,7 @@ def main():
     # ── run conversion ────────────────────────────────────────────────────
     results = []
 
+    # Pre-filter skips
     work_items = []
     for bag_dir in bag_dirs:
         bn = os.path.basename(bag_dir)
@@ -983,6 +824,7 @@ def main():
         work_items.append((bag_dir, h5_path))
 
     if jobs > 1 and len(work_items) > 1:
+        # ── parallel mode ─────────────────────────────────────────────
         print(f"\nParallel mode: {jobs} workers for {len(work_items)} bags")
         mp_items = [(bd, hp, settings) for bd, hp in work_items]
         ctx = multiprocessing.get_context("spawn")
@@ -997,6 +839,7 @@ def main():
                     f"{r.get('elapsed_sec', 0):.0f}s)"
                 )
     else:
+        # ── sequential mode ───────────────────────────────────────────
         for i, (bag_dir, h5_path) in enumerate(work_items):
             bn = os.path.basename(bag_dir)
             print(f"\n[{i + 1}/{len(work_items)}] {bn}")
@@ -1012,7 +855,7 @@ def main():
                 }
             r["elapsed_sec"] = round(time.time() - t0, 1)
             results.append(r)
-            gc.collect()
+            gc.collect()   # release memory between bags
 
             if r["status"] == "FAIL":
                 print(f"  FAIL: {r['error']}")

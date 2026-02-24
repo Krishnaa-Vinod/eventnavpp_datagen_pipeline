@@ -112,9 +112,18 @@ def decode_evt3(raw_bytes: bytes, width: int = 1280, height: int = 720,
     # ── Detect and unwrap 2^24 timestamp wraps ────────────────────────
     # TIME_HIGH is 12 bits; combined with TIME_LOW it gives a 24-bit
     # timestamp (max 2^24 - 1 = 16,777,215 µs ≈ 16.777 s).  After that
-    # the TIME_HIGH counter wraps from 4095 back to 0.
+    # the TIME_HIGH counter wraps from 4095 back to 0 (or any lower
+    # value — the wrap target depends on how far time advances between
+    # the last pre-wrap TIME_HIGH word and the first post-wrap one).
+    #
+    # Detection: TIME_HIGH payload is monotonically increasing.  Any
+    # decrease in the shifted value greater than a small noise margin
+    # indicates a 24-bit wrap.  We use a threshold of 256 payload
+    # steps (= 1,048,576 µs ≈ 1.05 s) which is well above any
+    # possible jitter but catches all wraps including partial ones
+    # (e.g. payload 3036 → 1184 = drop of 1852, far above 256).
     WRAP_24 = 1 << 24           # 16_777_216 µs
-    HALF_WRAP_TH = 1 << 23      # detection threshold (half range in shifted TH)
+    WRAP_DETECT_TH = 256 << 12  # 1,048,576 µs — min drop to count as wrap
 
     if len(th_pos) > 0:
         # Compare each TIME_HIGH set-point against its predecessor
@@ -123,7 +132,7 @@ def decode_evt3(raw_bytes: bytes, width: int = 1280, height: int = 720,
         th_changes[1:] = payloads[th_pos] << 12
 
         diffs = np.diff(th_changes)
-        wrap_flags = diffs < -HALF_WRAP_TH     # large negative jump → wrap
+        wrap_flags = diffs < -WRAP_DETECT_TH   # significant drop → wrap
 
         cum_wraps = np.cumsum(wrap_flags) + time_high_epoch
 

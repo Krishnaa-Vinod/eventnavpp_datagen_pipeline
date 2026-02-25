@@ -37,21 +37,35 @@ def fig_to_array(fig):
 
 def make_frame(idx, voxels, actions, timestamps,
                rgb_mask, rgb_images, rgb_lookup,
-               n_steps, swap_rb, fig, axes):
+               n_steps, swap_rb, fig, axes, goal_step=-1):
     """Draw one frame into *fig* and return an RGB numpy array."""
     ax_vox, ax_rgb, ax_act = axes
+    is_goal = (goal_step >= 0 and idx == goal_step)
 
     # ── title ──────────────────────────────────────────────────────────────
-    fig.suptitle(f"Step {idx} / {n_steps - 1}  |  TS {timestamps[idx]} ns",
-                 fontsize=13, fontweight="bold")
+    title = f"Step {idx} / {n_steps - 1}  |  TS {timestamps[idx]} ns"
+    if is_goal:
+        title += "  \u2605 GOAL STEP \u2605"
+    if goal_step >= 0:
+        title += f"  [goal={goal_step}]"
+    fig.suptitle(title, fontsize=13, fontweight="bold",
+                 color="green" if is_goal else "black")
 
     # ── 1. event voxel ────────────────────────────────────────────────────
     ax_vox.clear()
     v = voxels[idx]
     v_img = np.sum(v, axis=0)                 # sum across bins
     ax_vox.imshow(v_img, cmap="inferno")
-    ax_vox.set_title(f"Event Voxel ({v.shape[1]}×{v.shape[2]})\nSum of {v.shape[0]} bins",
-                     fontsize=10)
+    vox_title = f"Event Voxel ({v.shape[1]}\u00d7{v.shape[2]})\nSum of {v.shape[0]} bins"
+    if is_goal:
+        vox_title = "\u2605 GOAL VOXEL \u2605\n" + vox_title
+        # Draw green border around voxel panel
+        for spine in ax_vox.spines.values():
+            spine.set_visible(True)
+            spine.set_color("lime")
+            spine.set_linewidth(4)
+    ax_vox.set_title(vox_title, fontsize=10,
+                     color="lime" if is_goal else "black")
     ax_vox.axis("off")
 
     # ── 2. RGB ─────────────────────────────────────────────────────────────
@@ -111,6 +125,8 @@ def main():
                         help="Last step to render, inclusive (-1 = last)")
     parser.add_argument("--dpi", type=int, default=120,
                         help="Figure DPI (higher = larger video)")
+    parser.add_argument("--goal-step", type=int, default=-1,
+                        help="Goal step index to annotate (-1 = read from H5 attrs)")
     args = parser.parse_args()
 
     if not os.path.isfile(args.h5):
@@ -135,9 +151,15 @@ def main():
     end = n_steps - 1 if args.end < 0 else min(args.end, n_steps - 1)
     total = end - start + 1
 
+    # ── resolve goal step ──────────────────────────────────────────────────
+    goal_step = args.goal_step
+    if goal_step < 0 and "goal_step" in f.attrs:
+        goal_step = int(f.attrs["goal_step"])
+
     print(f"H5        : {args.h5}")
     print(f"Steps     : {n_steps}  (rendering {start}..{end}, {total} frames)")
-    print(f"RGB images: {len(rgb_images)}, swap R↔B: {args.swap_rb}")
+    print(f"RGB images: {len(rgb_images)}, swap R\u2194B: {args.swap_rb}")
+    print(f"Goal step : {goal_step}")
     print(f"Output    : {args.out}  @ {args.fps} fps, {args.dpi} dpi")
 
     # ── build RGB lookup ───────────────────────────────────────────────────
@@ -158,7 +180,7 @@ def main():
     # render first frame to get video dimensions
     frame0 = make_frame(start, voxels, actions, timestamps,
                         rgb_mask, rgb_images, rgb_lookup,
-                        n_steps, args.swap_rb, fig, axes)
+                        n_steps, args.swap_rb, fig, axes, goal_step)
     h, w = frame0.shape[:2]
     plt.tight_layout(rect=[0, 0, 1, 0.95])      # leave room for suptitle
 
@@ -175,7 +197,7 @@ def main():
     for idx in range(start + 1, end + 1):
         frame = make_frame(idx, voxels, actions, timestamps,
                            rgb_mask, rgb_images, rgb_lookup,
-                           n_steps, args.swap_rb, fig, axes)
+                           n_steps, args.swap_rb, fig, axes, goal_step)
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
         if (idx - start) % 20 == 0 or idx == end:

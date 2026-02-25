@@ -265,10 +265,11 @@ def decode_rgb(msg):
 
     if "bayer_rggb" in enc:
         img = data.reshape((h, w))
-        img = cv2.cvtColor(img, cv2.COLOR_BayerRG2RGB)
+        # OpenCV BayerBG == ROS bayer_rggb (naming offset by one row)
+        img = cv2.cvtColor(img, cv2.COLOR_BayerBG2RGB)
     elif "bayer" in enc:
         img = data.reshape((h, w))
-        img = cv2.cvtColor(img, cv2.COLOR_BayerBG2RGB)
+        img = cv2.cvtColor(img, cv2.COLOR_BayerRG2RGB)
     elif "bgr" in enc:
         img = data.reshape((h, w, 3))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
